@@ -1,0 +1,31 @@
+teacher:
+  model_id: openai/whisper-tiny
+  language: en
+  task: transcribe
+
+student:
+  state_size: 64          # SSM state per channel (×2 after Hedgehog = 128 effective)
+
+data:
+  dataset: librispeech_asr
+  train_split: train.100  # 100h clean speech (~28k utterances)
+  val_split: validation
+  max_label_length: 448   # Whisper max decode length
+
+training:
+  batch_size: 8
+
+  # Stage 1 — cosine distillation (SSM warm-up)
+  stage1_epochs: 2
+  stage1_lr: 0.0005       # higher lr OK — cosine loss is smooth
+
+  # Stage 2 — ASR fine-tuning (cross-entropy)
+  lr: 0.0001
+  epochs: 5
+
+  checkpoint_dir: ./checkpoints/whisper_mamba
+  log_every: 50
+  eval_every_steps: 500   # val loss (cheap — teacher-forced)
+  wer_every_steps: 1000   # val WER (expensive — autoregressive)
+  ss_max_p: 0.5           # scheduled sampling: ramps 0→50% over first half of Stage 2
+  tb_log_dir: runs/

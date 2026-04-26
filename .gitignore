@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Checkpoints — large, tracked separately if needed
+checkpoints/
+*.pt
+*.pth
+*.npz
+*.safetensors
+
+# Training outputs
+logs/
+runs/
+runs_nan_run/
+results/
+
+# Data caches
+data_cache/
+teacher_cache/
+*.bin
+*.arrow
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# HuggingFace cache
+.cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

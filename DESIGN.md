@@ -1,0 +1,240 @@
+# Design Notes
+
+Architecture and implementation decisions for this re-implementation of HedgeMamba (arXiv:2604.14191).
+
+---
+
+## 1. Why two stages
+
+The naive approach — randomly initialise a Mamba student and train it with KL divergence against the teacher — fails badly (validation perplexity > 100 in the paper's ablations). The two-stage recipe exists to avoid this:
+
+**Stage 1** trains the SSM layers to *mimic the teacher's hidden states*, not to predict tokens. This forces the SSM to learn the same representational structure as the attention layers it's replacing — without the instability of autoregressive loss on random weights.
+
+**Stage 2** then fine-tunes the full student on task loss (cross-entropy). The SSM layers start from a warm state rather than random noise, so convergence is fast and stable.
+
+The Hedgehog feature map (Stage 1 linear attention) provides a principled bridge: it shares the same mathematical structure as softmax attention but is a special case of the SSM, so the parameters learned in Stage 1 can be surgically mapped into the SSM's B and C matrices (Appendix B of the paper).
+
+---
+
+## 2. Why I switched from Pythia to Whisper
+
+My first implementation targeted Pythia-14m, a 14M parameter GPT-NeoX language model. The pipeline worked correctly but the results were not interesting:
+
+- A 14M model is weak enough that teacher and random-SSM-student produce similar perplexities anyway
+- The distillation signal (difference between teacher and student hidden states) is small
+- OpenWebText token representations are sparse — many tokens appear rarely and the cosine loss gradient is noisy
+
+Switching to Whisper-tiny resolved all of these:
+
+- The encoder produces **dense mel-spectrogram features** — every dimension carries information for every input, so cosine similarity between teacher and student hidden states has a strong, consistent gradient
+- The task (speech recognition) has a clear binary metric (WER) — you can hear whether the student is working
+- The architecture is convenient: encoder is frozen, only the decoder self-attention gets replaced. Clean experiment.
+
+The Pythia code remains in `src/distill/stage1.py`, `stage2.py`, `src/teachers/`, and `configs/pythia_70m_to_mamba.yaml` for reference.
+
+---
+
+## 3. HedgeMamba layer
+
+### 3.1 Hedgehog projection
+
+```
+φ(x) = softmax([Wx, −Wx], dim=-1)    x ∈ ℝᴺ → φ(x) ∈ ℝ²ᴺ
+```
+
+Applied to the B (keys) and C (queries) projections. This doubles the effective state dimension from N to 2N = Ns.
+
+The doubling is important: the normalization duplication trick (`concat([V, ones])`) uses the extra Ns to carry the denominator of the normalized linear attention in the same scan as the numerator. One scan, two outputs.
+
+### 3.2 Selective SSM
+
+```
+h[t] = exp(Δ[t] · A) · h[t-1] + (Δ[t] · u[t]) ⊗ B[t]
+y[t] = C[t] · h[t]
+```
+
+- `A`: diagonal matrix, stored as `A_log = log(-A)` for numerical stability
+- `Δ[t]`: input-dependent, computed as `softplus(dt_proj(dt_rank_proj(x[t])))`
+- `B[t]`, `C[t]`: Hedgehog-projected versions of the raw B/C projections
+- `u[t]`: value projection `v_proj(x_conv[t])` (after causal depthwise conv)
+
+The discretization is ZOH: `Ā = exp(Δ · A)`, `B̄ = Δ · B`.
+
+### 3.3 Normalization duplication
+
+Instead of:
+```
+y = (C · h_num) / (C · h_den)
+```
+which requires two scans, the paper's trick:
+```
+V_dup = concat([V, ones])     → shape (B, L, 2D)
+A_dup = concat([A, A])        → shape (2D, Ns)
+```
+Run one scan over `V_dup`. Split output into numerator `(B, L, D)` and denominator `(B, L, D)`. Divide: `y = gate * y_num / (|y_den| + ε)`.
+
+### 3.4 Causal depthwise conv
+
+A width-4 causal depthwise convolution applied before the SSM. It mixes local context before the long-range SSM state update — same role as in original Mamba.
+
+PyTorch stores weights as `(D, 1, k)`. MLX needs `(D, k, 1)` — this transposition happens in the PT→MLX weight bridge (`src/mlx/checkpoint.py`).
+
+### 3.5 Fix-B state caching (inference)
+
+During autoregressive generation, the HF generate loop passes one new token per step. A naive SSM would reset `h` to zero each step. Fix-B maintains `h_cache` and `conv_cache` across steps:
+
+```
+step 1:  h = None  →  SSM processes prompt, returns h_1
+step 2:  h = h_1   →  SSM processes one token, returns h_2
+...
+```
+
+In PyTorch this is done via `_h_cache` / `_conv_cache` on `WhisperHedgeMambaLayer`. In MLX the mlx-whisper kv_cache mechanism handles it: the SSM returns `(token_counter, (h, conv_ctx))` as its "kv_cache", which the decoder block passes back unchanged on the next step.
+
+---
+
+## 4. Two-stage training
+
+### Stage 1 — cosine distillation
+
+Only the SSM layers train. Everything else (encoder, cross-attention, FFN, layer norms, embeddings) is frozen.
+
+Loss:
+```
+L₁ = (1/n_layers) Σᵢ mean(1 - cosine_sim(student_hᵢ, teacher_hᵢ, dim=-1))
+```
+
+where `hᵢ` is the output of decoder block i (post-residual, post-cross-attention, post-FFN) — not just the self-attention output. Matching full block outputs forces the SSM to produce representations compatible with the frozen cross-attention that sits above it.
+
+Note: MPS and MLX both have float16 precision issues with cosine similarity. Activations must be in float32 before computing the loss.
+
+### Stage 2 — ASR fine-tuning with scheduled sampling
+
+Trained parameters: SSM, cross-attention, FFN, layer norms. Encoder and embeddings stay frozen.
+
+Loss: cross-entropy on next transcript token.
+
+**Scheduled sampling** closes the teacher-forcing gap. During training the decoder sees ground-truth tokens as input; during inference it sees its own predictions. The gap causes a distribution shift.
+
+Fix: replace a fraction `p` of ground-truth decoder tokens with the student's own predictions from a no-grad forward pass:
+
+```
+p(step) = ss_max_p × min(1, step / (total_steps × 0.5))
+```
+
+`ss_max_p = 0.5` — by the end of training, half the decoder input tokens are self-generated. This forces the student to be robust to its own prediction errors.
+
+---
+
+## 5. MLX port
+
+The full training pipeline has an MLX backend in `src/mlx/`. Key differences from PyTorch:
+
+**No backward() / autograd tape.** MLX uses `nn.value_and_grad(model, loss_fn)`:
+```python
+loss_and_grad_fn = nn.value_and_grad(student, loss_fn)
+loss, grads = loss_and_grad_fn(student, mel, decoder_ids, ...)
+optimizer.update(student, grads)
+mx.eval(student.parameters(), optimizer.state, loss)
+```
+`mx.eval()` is critical — it flushes MLX's lazy computation graph and actually executes the Metal kernels.
+
+**Freezing via module methods.** MLX has no `requires_grad=False`. Freezing is done by calling `module.freeze()` / `module.unfreeze()`:
+- Stage 1: `model.freeze()` then `block.attn.unfreeze()` per block
+- Stage 2: `model.freeze()` then `block.unfreeze()` per block + `decoder.ln.unfreeze()`
+
+**No built-in ignore_index in cross_entropy.** Implemented manually:
+```python
+valid = (labels_flat >= 0).astype(mx.float32)
+safe_labels = mx.clip(labels_flat, 0, V-1)
+loss = (cross_entropy(logits, safe_labels, reduction='none') * valid).sum() / valid.sum()
+```
+
+**LR scheduling is manual.** MLX optimizers have a settable `learning_rate` attribute; cosine decay with warmup is implemented in `src/mlx/utils.py`.
+
+**Data workers must be 0.** MLX arrays cannot cross process boundaries, so all DataLoaders use `num_workers=0`. Preprocessing runs in the main process but is cached by HuggingFace datasets after the first run.
+
+**Mel format transposition.** PyTorch Whisper uses `(B, 80, T)`, MLX whisper uses `(B, T, 80)`. Transposed in `pt_batch_to_mlx()`.
+
+**SSM scan speedup.** The Python for-loop over sequence positions is fused by MLX's lazy evaluator into fewer Metal kernel dispatches. Measured ~2.3× faster scan, ~3.7× faster end-to-end vs PyTorch MPS.
+
+---
+
+## 6. Parameter surgery (Appendix B)
+
+When transitioning from Stage 1 (Hedgehog linear attention) to Stage 2 (full SSM), the paper maps Hedgehog weights into SSM B/C:
+
+| SSM param | Source | Rationale |
+|-----------|--------|-----------|
+| `B_proj.weight` | `k_proj.weight` (Hedgehog key) | B encodes input → state; K encodes input → key |
+| `C_proj.weight` | `q_proj.weight` (Hedgehog query) | C reads state → output; Q reads state → query |
+| `A_log` | initialized to log(1..Ns) | Stable exponential decay at init |
+| `conv.weight` | identity kernel | No local mixing at init |
+| `gate_proj` | zeros | No gating at init |
+
+This warm start avoids the loss spike that would occur from random SSM initialization after Stage 1.
+
+In this repo the surgery is in `src/student/param_init.py`. It runs automatically when `WhisperMambaStudent` is constructed (the `HedgeMambaMixer` constructor calls `param_init`).
+
+---
+
+## 7. Held-out evaluation — teacher vs student on unseen data
+
+The student was trained on LibriSpeech `train-clean-100` and validated on `validation.clean`. The `test` splits of both the `clean` and `other` configs were never seen during training or used for any hyperparameter decisions. We evaluate both teacher and student on these splits to check whether the distillation generalised beyond the training distribution.
+
+All predictions are normalised to lowercase with punctuation stripped before WER is computed, so formatting differences between teacher (mixed-case) and student (trained on lowercase) don't artificially inflate the teacher's WER.
+
+### Results (300 samples per split, greedy decoding, `repetition_penalty=1.1`)
+
+| Split | Domain | Teacher WER | Student WER | Gap |
+|-------|--------|-------------|-------------|-----|
+| `test.clean` | Clean audiobooks, diverse speakers | 9.65% | **8.49%** | −1.15% |
+| `test.other` | Noisier recordings, more accent variation | 20.23% | **18.0%** | −2.23% |
+
+### What the numbers say
+
+**The student outperforms the teacher on both splits.** This is the headline result and it holds up on the harder `test.other` split where the gap is larger (2.2 pp vs 1.2 pp). A few things explain it:
+
+1. **Fine-tuning on LibriSpeech.** The original Whisper-tiny was trained on a broad mix of web audio. The student was explicitly fine-tuned on LibriSpeech transcriptions — lowercase, clean, audiobook-style. The test splits come from the same distribution, so the student is better matched to the reference format even after normalisation.
+
+2. **Scheduled sampling closes the exposure gap.** The teacher is evaluated autoregressively but was never trained with its own predictions as decoder input. The student's Stage 2 scheduled sampling explicitly prepares it for this — by the end of training half the decoder input tokens are the student's own predictions, so it's robust to its own errors in a way the teacher is not.
+
+3. **Task specialisation.** The teacher is `openai/whisper-tiny` — the multilingual model (99 languages, 51,865-token vocab). The student inherits the same architecture but was fine-tuned on English LibriSpeech transcriptions only. Fine-tuning a multilingual model on a single-language task typically improves WER on that task, and that effect carries through to the student.
+
+The WER gap grows from clean (−1.2%) to other (−2.2%), which suggests the student's robustness advantage is larger under harder conditions. This is somewhat surprising — one might expect the SSM's fixed-state approximation to degrade more on harder speech — but it does not, at least within LibriSpeech-style audiobooks.
+
+### Sample transcription comparison
+
+A few representative examples from `test.clean`:
+
+| Reference | Teacher | Student |
+|-----------|---------|---------|
+| concord returned to its place | **conquered** returned to its place | **coloncore** returned to its place |
+| congratulations were poured in upon the princess | congratulations **report** in upon the princess | **conggradulations** were poured in upon the princess |
+| you will be frank with me i always am | ✓ correct | ✓ correct |
+| can you imagine why buckingham has been so violent | can you imagine **my** buckingham | can you imagine **my** buckingham |
+
+Both models struggle with the same rare proper nouns and uncommon words. The error patterns are similar in character — substitutions, not insertions — which is consistent with two models that have learned the same underlying language representation but with slightly different fine-tuning.
+
+### What this evaluation does not cover
+
+The test splits are still clean read speech (audiobooks). They are genuinely held-out but not out-of-domain in the full sense. The student has not been evaluated on:
+
+- **Spontaneous speech** — conversational, disfluent, with false starts and filler words
+- **Telephone / noisy conditions** — CHiME, NOISY student challenge  
+- **Accented English** — non-native speakers, regional dialects
+- **Different domains** — meetings (AMI), broadcast news, medical dictation
+
+Performance on those would likely be worse for both teacher and student, and the relative gap could go either way. That evaluation is left for future work (`scripts/eval_ood.py` is ready; it just needs a dataset that loads cleanly from HuggingFace without auth).
+
+---
+
+## 8. Known gaps and future work
+
+**Python scan loop.** The selective SSM scan is an O(L) Python loop. With MLX lazy eval this compiles to ~2.3× fewer Metal dispatches than PyTorch MPS, but it's still O(L) dispatch calls. A fused Metal kernel via `mlx.core.custom_op` would reduce this to a single kernel invocation. Estimated 1–2 weeks of Metal Shading Language work. Tracked in `MLX_PLAN.md`.
+
+**Greedy decoding only.** The MLX inference uses mlx-whisper's `dec.decode` which doesn't support beam search. The PyTorch student is evaluated with `repetition_penalty=1.1` but no beam search either. Adding beam search to the MLX path would likely close some of the WER gap vs the paper.
+
+**Evaluated on English LibriSpeech only.** See Section 7 for held-out test results. The teacher (`openai/whisper-tiny`) is multilingual; the student was fine-tuned on English only. Other languages and domains — spontaneous speech, noisy conditions, accents, meetings — are untested.
+
+**Pythia distillation incomplete.** The LM distillation pipeline (Stage 1 + Stage 2 on OpenWebText) was validated for correctness but not run to completion. The teacher (Pythia-14m) is too small to produce meaningful numbers. Pythia-70m or larger would be the right next experiment.

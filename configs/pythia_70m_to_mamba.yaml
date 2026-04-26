@@ -1,0 +1,44 @@
+teacher:
+  model_id: EleutherAI/pythia-14m
+  num_layers: 6
+  hidden_size: 128
+  num_attention_heads: 4
+
+student:
+  hidden_size: 512
+  num_layers: 6
+  ssm_state_size: 16
+  expand: 2
+  conv_kernel: 4
+  dt_rank: auto
+
+data:
+  dataset: openwebtext
+  tokenizer: EleutherAI/pythia-70m
+  seq_len: 1024
+  cache_dir: ./data_cache
+
+stage1:
+  tokens: 100_000_000
+  debug_tokens: 10_000_000
+  batch_size: 8
+  lr: 0.0003
+  loss: cosine
+  teacher_cache_dir: ./teacher_cache
+  checkpoint_dir: ./checkpoints/stage1
+
+stage2:
+  tokens: 500_000_000
+  debug_tokens: 10_000_000
+  batch_size: 8
+  lr: 0.00003          # lowered from 1e-4; SSM eigenvalue dynamics are sensitive
+  checkpoint_every_tokens: 50_000_000
+  eval_every_tokens: 10_000_000
+  checkpoint_dir: ./checkpoints/stage2
+
+eval:
+  val_split: validation
+  tasks:
+    - lambada_openai
+    - hellaswag
+    - winogrande
