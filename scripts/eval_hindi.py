@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch, jiwer, numpy as np, soundfile as sf
-from datasets import load_dataset
+from datasets import load_dataset, Audio, Features, Value
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from src.student.whisper_mamba import WhisperMambaStudent
@@ -45,21 +45,28 @@ DEVICE = args.device
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-print("Loading Kathbath Hindi test set...", flush=True)
-ds = load_dataset("ai4bharat/Kathbath", "hindi", split="test")
-ds = ds.select(range(min(args.n_samples, len(ds))))
-print(f"Loaded {len(ds)} samples. Columns: {ds.column_names}", flush=True)
-
-# Discover text column
-text_col = next(
-    c for c in ds.column_names
-    if any(k in c.lower() for k in ["transcript", "text", "sentence", "normalized"])
-)
+print("Loading Kathbath Hindi validation set (streaming)...", flush=True)
+# Kathbath Hindi has splits: valid, train (no separate test split)
+# Use streaming to avoid downloading the full dataset
+_feats = Features({
+    "fname": Value("string"),
+    "text": Value("string"),
+    "audio_filepath": Audio(sampling_rate=None, decode=False),
+    "lang": Value("string"),
+    "duration": Value("float64"),
+    "gender": Value("string"),
+    "speaker_id": Value("int64"),
+})
+ds_stream = load_dataset("ai4bharat/Kathbath", "hindi", split="valid",
+                         streaming=True, features=_feats)
+ds = list(ds_stream.take(args.n_samples))
+print(f"Loaded {len(ds)} samples. Columns: {list(ds[0].keys())}", flush=True)
+text_col = "text"
 print(f"Using text column: {text_col!r}", flush=True)
 
 
 def _to_mel(example, processor):
-    info = example["audio"]
+    info = example["audio_filepath"]
     if isinstance(info, dict):
         if "array" in info:
             arr, sr = info["array"], info["sampling_rate"]

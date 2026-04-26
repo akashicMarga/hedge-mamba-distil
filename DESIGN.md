@@ -235,6 +235,6 @@ Performance on those would likely be worse for both teacher and student, and the
 
 **Greedy decoding only.** The MLX inference uses mlx-whisper's `dec.decode` which doesn't support beam search. The PyTorch student is evaluated with `repetition_penalty=1.1` but no beam search either. Adding beam search to the MLX path would likely close some of the WER gap vs the paper.
 
-**Evaluated on English LibriSpeech only.** See Section 7 for held-out test results. The teacher (`openai/whisper-tiny`) is multilingual; the student was fine-tuned on English only. Other languages and domains — spontaneous speech, noisy conditions, accents, meetings — are untested.
+**Evaluation scope is narrow.** See Section 7 for held-out test results on LibriSpeech `test` splits. The teacher (`openai/whisper-tiny`) is multilingual (99 languages); the student was fine-tuned on English only. Cross-lingual capability after English fine-tuning has not been properly measured — a rigorous evaluation would need a clean Hindi (or other language) benchmark with proper normalisation and a baseline that rules out WER inflation from script mismatch. Other untested domains: spontaneous speech, telephone/noisy conditions, accented English, meetings.
 
 **Pythia distillation incomplete.** The LM distillation pipeline (Stage 1 + Stage 2 on OpenWebText) was validated for correctness but not run to completion. The teacher (Pythia-14m) is too small to produce meaningful numbers. Pythia-70m or larger would be the right next experiment.
