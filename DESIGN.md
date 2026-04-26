@@ -2,6 +2,12 @@
 
 Architecture and implementation decisions for this re-implementation of HedgeMamba (arXiv:2604.14191).
 
+Animated walkthroughs of the two training stages:
+
+| Stage 1 — Cosine Distillation | Stage 2 — Scheduled Sampling |
+|-------------------------------|-------------------------------|
+| ![Stage 1](assets/stage1_cosine_distill.gif) | ![Stage 2](assets/stage2_scheduled_sampling.gif) |
+
 ---
 
 ## 1. Why two stages

@@ -44,3 +44,9 @@ teacher_cache/
 .idea/
 *.swp
 *.swo
+
+# Manim render output
+media/
+
+# Claude Code internal
+.claude/

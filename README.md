@@ -71,6 +71,18 @@ The HedgeMambaMixer itself:
 
 ---
 
+## Distillation walkthrough
+
+**Stage 1 — cosine distillation** (parameter surgery → Hedgehog map → SSM recurrence → layer-wise cosine loss):
+
+![Stage 1 cosine distillation](assets/stage1_cosine_distill.gif)
+
+**Stage 2 — ASR fine-tuning with scheduled sampling** (token replacement ramps 0→50% → CE loss):
+
+![Stage 2 scheduled sampling](assets/stage2_scheduled_sampling.gif)
+
+---
+
 ## Quick start
 
 ```bash
