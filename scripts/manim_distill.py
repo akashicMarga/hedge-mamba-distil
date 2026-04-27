@@ -65,12 +65,10 @@ class Stage1(Scene):
         l2 = label("W_C ← W_q", 22, YELLOW).next_to(a2, DOWN, buff=0.06)
         note = label("key/query projections become B/C in the scan", 18, DIM_C).move_to(DOWN*1.8)
 
-        self.play(FadeIn(tc), FadeIn(wk), FadeIn(wq))
-        self.play(FadeIn(sc), FadeIn(wb), FadeIn(wc))
-        self.play(GrowArrow(a1), GrowArrow(a2))
-        self.play(Write(l1), Write(l2))
-        self.play(FadeIn(note))
-        self.wait(1.5)
+        self.play(FadeIn(tc), FadeIn(wk), FadeIn(wq), FadeIn(sc), FadeIn(wb), FadeIn(wc), run_time=0.4)
+        self.play(GrowArrow(a1), GrowArrow(a2), run_time=0.4)
+        self.play(Write(l1), Write(l2), FadeIn(note), run_time=0.4)
+        self.wait(0.5)
         self._fade(step, tc, wk, wq, sc, wb, wc, a1, a2, l1, l2, note)
 
     # ── Hedgehog projection ───────────────────────────────────────────────────
@@ -82,11 +80,9 @@ class Stage1(Scene):
         dim  = label("x ∈ ℝᴰ  ──φ──▶  ℝ²ᴺ   (state size doubles)", 28, DIM_C).next_to(phi, DOWN, buff=0.5)
         why  = label("approximates softmax attention as a linear inner product", 19, DIM_C).next_to(dim, DOWN, buff=0.3)
 
-        self.play(Write(phi))
-        self.play(Create(box))
-        self.play(FadeIn(dim))
-        self.play(FadeIn(why))
-        self.wait(1.5)
+        self.play(Write(phi), run_time=0.4)
+        self.play(Create(box), FadeIn(dim), FadeIn(why), run_time=0.4)
+        self.wait(0.5)
         self._fade(step, phi, box, dim, why)
 
     # ── SSM recurrence ────────────────────────────────────────────────────────
@@ -100,14 +96,11 @@ class Stage1(Scene):
         blbl  = label("O(1) per step\nat inference", 17, STUDENT_C).next_to(brace, LEFT, buff=0.15)
 
         dt  = label("Δ_t = softplus(W_Δ · x_t)   ← input-dependent step size", 25, DIM_C).next_to(r2, DOWN, buff=0.5)
-        zoh = label("Ā = exp(Δ·A)     B̄ = (exp(Δ·A) − I) A⁻¹B     (ZOH discretization)", 21, DIM_C).next_to(dt, DOWN, buff=0.3)
+        zoh = label("Ā = exp(Δ·A)     B̄ = (exp(Δ·A) − I) A⁻¹B     (ZOH)", 21, DIM_C).next_to(dt, DOWN, buff=0.3)
 
-        self.play(Write(r1))
-        self.play(Write(r2))
-        self.play(FadeIn(brace), FadeIn(blbl))
-        self.play(FadeIn(dt))
-        self.play(FadeIn(zoh))
-        self.wait(1.5)
+        self.play(Write(r1), Write(r2), run_time=0.4)
+        self.play(FadeIn(brace), FadeIn(blbl), FadeIn(dt), FadeIn(zoh), run_time=0.4)
+        self.wait(0.5)
         self._fade(step, r1, r2, brace, blbl, dt, zoh)
 
     # ── Cosine loss ───────────────────────────────────────────────────────────
@@ -131,12 +124,10 @@ class Stage1(Scene):
             18, DIM_C
         ).next_to(loss, DOWN, buff=0.35)
 
-        self.play(FadeIn(ht), Create(bt))
-        self.play(FadeIn(hs), Create(bs))
-        self.play(GrowArrow(arr), Write(sim))
-        self.play(Write(loss))
-        self.play(FadeIn(frozen))
-        self.wait(2.5)
+        self.play(FadeIn(ht), Create(bt), FadeIn(hs), Create(bs), run_time=0.4)
+        self.play(GrowArrow(arr), Write(sim), run_time=0.4)
+        self.play(Write(loss), FadeIn(frozen), run_time=0.4)
+        self.wait(0.8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

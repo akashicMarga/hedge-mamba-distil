@@ -2,6 +2,8 @@
 
 > This is a personal re-implementation of [**"Attention to Mamba: A Recipe for Cross-Architecture Distillation"**](https://arxiv.org/abs/2604.14191) (Moudgil et al., Apple + MILA, April 2026). Not the authors' code, not affiliated with them. Results may differ from the paper.
 
+**Model weights:** [akashicmarga/whisper-tiny-hedgemamba](https://huggingface.co/akashicmarga/whisper-tiny-hedgemamba) on Hugging Face
+
 ---
 
 ## What I was trying to do
