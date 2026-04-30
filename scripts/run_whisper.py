@@ -74,6 +74,18 @@ def main():
         help="Tiny subset (100 train, 20 val) for quick sanity check",
     )
     parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Subset training data to N samples (e.g. 2000 for a ~15 min speed run)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override number of Stage 2 epochs",
+    )
+    parser.add_argument(
         "--skip_stage1",
         action="store_true",
         help="Skip Stage 1 cosine distillation (use if resuming from a Stage 1 checkpoint)",
@@ -124,25 +136,36 @@ def main():
         max_label_length=cfg["data"]["max_label_length"],
     )
 
-    if args.debug:
+    if args.debug or args.max_samples:
         from torch.utils.data import Subset, DataLoader as DL
         from src.data.librispeech import LibriSpeechCollator
         collate_fn = LibriSpeechCollator()
+        if args.debug:
+            n_train, n_val = 100, 20
+        else:
+            n_train = min(args.max_samples, len(train_loader.dataset))
+            n_val = min(500, len(val_loader.dataset))
         train_loader = DL(
-            Subset(train_loader.dataset, range(100)),
+            Subset(train_loader.dataset, range(n_train)),
             batch_size=cfg["training"]["batch_size"],
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=0,
+            num_workers=2,
         )
         val_loader = DL(
-            Subset(val_loader.dataset, range(20)),
+            Subset(val_loader.dataset, range(n_val)),
             batch_size=cfg["training"]["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=0,
+            num_workers=2,
         )
-        print("DEBUG mode: 100 train / 20 val samples", flush=True)
+        steps_per_epoch = n_train // cfg["training"]["batch_size"]
+        # Scale wer_every_steps so we get ~2 WER evals per epoch
+        cfg["training"]["wer_every_steps"] = max(50, steps_per_epoch // 2)
+        cfg["training"]["eval_every_steps"] = max(25, steps_per_epoch // 4)
+        print(f"Subset mode: {n_train} train / {n_val} val samples "
+              f"({steps_per_epoch} steps/epoch, "
+              f"WER every {cfg['training']['wer_every_steps']} steps)", flush=True)
 
     ckpt_dir = Path(cfg["training"]["checkpoint_dir"])
 
@@ -239,7 +262,7 @@ def main():
         optimizer=s2_optimizer,
         processor=processor,
         device=device,
-        epochs=cfg["training"]["epochs"] if not args.debug else 1,
+        epochs=args.epochs if args.epochs is not None else (1 if args.debug else cfg["training"]["epochs"]),
         checkpoint_dir=str(ckpt_dir),
         tb_log_dir=cfg["training"]["tb_log_dir"],
         log_every=cfg["training"]["log_every"],

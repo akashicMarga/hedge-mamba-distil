@@ -39,6 +39,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.ops.selective_scan import selective_scan as _metal_selective_scan
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,36 +183,14 @@ class HedgeMambaMixer(nn.Module):
         y:       (B, L, 2D)
         h_final: (B, 2D, Ns)  — cache for Fix-B single-step generation
 
-        ZOH discretization:
-            dA[t]  = exp(Δ[t] · A)
-            dBu[t] = (Δ[t] · u[t]) ⊗ B[t]
-            h[t]   = dA[t] · h[t-1] + dBu[t]
-            y[t]   = C[t] · h[t]
+        Dispatches to the fused Metal kernel when:
+          - Running on Apple Silicon (MLX available)
+          - Ns is a power of 2 and ≤ 256
+          - Sequence length L > 1 (single-step AR decode skips kernel overhead)
 
-        All dA / dBu tensors are pre-computed in vectorised form (one batched
-        exp + two broadcasts) to minimise Python overhead before the loop.
-        On CUDA this can be replaced by a fused Triton scan kernel; on MPS
-        torch.compile fuses the loop and reduces dispatch overhead.
+        Falls back to the original PyTorch loop otherwise.
         """
-        Bb, L, D2 = u.shape
-        Ns = B.shape[-1]
-
-        # NOTE on pre-computing dA/dBu upfront:
-        # Allocating (B, L, D2, Ns) tensors then reading them back L times
-        # is slower on MPS than computing per-step (B, D2, Ns) slices that
-        # fit in cache.  The proper fix is a fused Metal/Triton kernel.
-
-        h = h_prev if h_prev is not None else u.new_zeros(Bb, D2, Ns)
-        outputs = []
-        for t in range(L):
-            # dA: (B, D2, Ns)
-            dA  = torch.exp(dt[:, t].unsqueeze(-1) * A.unsqueeze(0))
-            # dBu: (B, D2, Ns)
-            dBu = (dt[:, t] * u[:, t]).unsqueeze(-1) * B[:, t].unsqueeze(1)
-            h   = dA * h + dBu                                 # (B, D2, Ns)
-            outputs.append((h * C[:, t].unsqueeze(1)).sum(-1)) # (B, D2)
-
-        return torch.stack(outputs, dim=1), h   # (B, L, D2), (B, D2, Ns)
+        return _metal_selective_scan(u, dt, A, B, C, h_prev)
 
     # ── Forward ───────────────────────────────────────────────────────────
 

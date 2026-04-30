@@ -15,6 +15,7 @@ Interface mirrors mlx_whisper.whisper.MultiHeadAttention:
 import math
 import mlx.core as mx
 import mlx.nn as nn
+from src.ops.selective_scan import selective_scan_mlx
 
 
 # ── Hedgehog projection ────────────────────────────────────────────────────────
@@ -90,21 +91,8 @@ class HedgeMambaMixerMLX(nn.Module):
     # ── selective scan ────────────────────────────────────────────────────────
 
     def _selective_scan(self, u, dt, A, B_feat, C_feat, h_prev):
-        """h[t] = exp(Δ·A)·h[t-1] + (Δ·u)⊗B[t];  y[t] = C[t]·h[t]."""
-        Bb, L, D2 = u.shape
-        Ns = B_feat.shape[-1]
-        h = h_prev if h_prev is not None else mx.zeros((Bb, D2, Ns))
-
-        outputs = []
-        for t in range(L):
-            dA  = mx.exp(mx.expand_dims(dt[:, t], -1) * mx.expand_dims(A, 0))
-            dBu = (mx.expand_dims(dt[:, t] * u[:, t], -1)
-                   * mx.expand_dims(B_feat[:, t], 1))
-            h   = dA * h + dBu
-            outputs.append((h * mx.expand_dims(C_feat[:, t], 1)).sum(axis=-1))
-
-        # mx.stack is lazy — the whole loop is fused on eval
-        return mx.stack(outputs, axis=1), h
+        """Dispatches to Metal kernel (no PT bridge) when available."""
+        return selective_scan_mlx(u, dt, A, B_feat, C_feat, h_prev)
 
     # ── forward  (mlx-whisper MultiHeadAttention interface) ──────────────────
 

@@ -121,6 +121,18 @@ python scripts/long_audio_bench.py   # Latency vs decode length (shows O(1) SSM 
 python scripts/mic_demo.py           # Live microphone demo
 ```
 
+### Scan kernel benchmarks
+
+```bash
+# MLX training step: Metal kernel vs Python loop (the recommended path)
+python scripts/mlx_train_bench.py
+
+# PyTorch MPS training step: Metal kernel vs Python loop (legacy comparison)
+python scripts/train_step_bench.py
+```
+
+The scan kernels live in `src/ops/selective_scan.py` — see [DESIGN.md](DESIGN.md#custom-metal-scan-kernels) for the full experiment writeup and why the speedup differs between paths.
+
 ---
 
 ## Deviations from the paper
@@ -129,7 +141,7 @@ python scripts/mic_demo.py           # Live microphone demo
 |-------|-----------|--------|
 | RoPE on B and C | Omitted | Whisper already has positional embeddings |
 | `state_size = hidden_size` (N = D = 384) | `state_size = 64` (Ns = 128 after Hedgehog) | N = D makes scan state (B, 768, 768) — too slow on MPS |
-| Parallel associative scan | Python for-loop | No fused Metal/Triton kernel yet |
+| Parallel associative scan | Python for-loop (MLX) / Metal kernel (PyTorch) | MLX lazy eval fuses the loop natively — explicit kernel only needed for PyTorch MPS path |
 | Per-head Hedgehog (H heads × D/H dim) | Single virtual head of size N | Avoids the H × D_h = D constraint when N ≠ D_h |
 
 ---

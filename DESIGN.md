@@ -162,7 +162,63 @@ loss = (cross_entropy(logits, safe_labels, reduction='none') * valid).sum() / va
 
 **Mel format transposition.** PyTorch Whisper uses `(B, 80, T)`, MLX whisper uses `(B, T, 80)`. Transposed in `pt_batch_to_mlx()`.
 
-**SSM scan speedup.** The Python for-loop over sequence positions is fused by MLX's lazy evaluator into fewer Metal kernel dispatches. Measured ~2.3× faster scan, ~3.7× faster end-to-end vs PyTorch MPS.
+**SSM scan speedup.** The Python for-loop over sequence positions is fused by MLX's lazy evaluator into fewer Metal kernel dispatches. Measured ~85 ms/step (batch=4, L=448) end-to-end — roughly 8× faster than the PyTorch MPS Python-loop path.
+
+---
+
+## 5.1 Custom Metal scan kernels — experiment and result
+
+### Motivation
+
+In the PyTorch MPS training path the selective SSM scan is an O(L) Python for-loop. PyTorch's eager execution dispatches a separate Metal shader per operation per timestep — ~4 Metal commands × L=448 timesteps = ~1 800 GPU round-trips per scan call, per decoder layer, per training step. This is the dominant bottleneck.
+
+### What we built
+
+Four custom Metal compute kernels written in Metal Shading Language via `mx.fast.metal_kernel` (MLX), wired into `src/ops/selective_scan.py`:
+
+| Kernel | Role |
+|--------|------|
+| `_fwd_inf_kernel` | Inference forward — no h_states saved |
+| `_fwd_train_kernel` | Training forward — saves h_states `(B, L+1, D2, Ns)` for backward |
+| `_bwd1_kernel` | Backward recurrence per `(b,d)` threadgroup → `grad_dt`, `grad_u`, `grad_A`, `grad_h0` |
+| `_bwd2_kernel` | Parallel `(b,t)` threadgroup → `grad_B`, `grad_C` (no atomics, iterates over D2) |
+
+The backward uses a dual-tree reduction in threadgroup shared memory (`scratch[512]`) to compute `grad_dt` and `grad_u` simultaneously. `grad_A` is accumulated per-batch in `_bwd1_kernel` and summed over the batch dimension in Python.
+
+Autograd integration differs by backend:
+- **PyTorch path**: `torch.autograd.Function` (`_SelectiveScanMetal`) with PT↔MLX tensor bridge (`MPS → CPU → MLX → CPU → MPS`)
+- **MLX path**: `mx.custom_vjp` with direct `mx.array` I/O — zero copies
+
+### Results
+
+**PyTorch MPS path** (measured on M5 Pro, batch=2, L=448, D2=768, Ns=128):
+
+| Scan | ms / step (fwd+bwd) | Speedup |
+|------|---------------------|---------|
+| Python for-loop (PyTorch eager) | 688 ms | 1× |
+| Metal kernel (via PT↔MLX bridge) | 45 ms | **15.2×** |
+
+**MLX path** (measured on M5 Pro, batch=4, L=448):
+
+| Scan | ms / step (fwd+bwd) | Speedup |
+|------|---------------------|---------|
+| Python for-loop (MLX lazy eval) | 85 ms | 1× |
+| Metal kernel (`mx.custom_vjp`) | 89 ms | **0.96×** (no gain) |
+
+### Why the MLX kernel gives no speedup
+
+The 15.2× gain in the PyTorch path came entirely from eliminating eager Metal dispatch — PyTorch MPS dispatches ~1 800 separate shader invocations per scan, which bottlenecks on CPU-GPU round-trip overhead, not compute.
+
+MLX's lazy evaluation already solves this. When MLX traces the Python for-loop, it builds a computation graph rather than dispatching anything immediately. `mx.eval()` then compiles and launches the whole scan as a small set of fused Metal operations in a single submission — the same thing our explicit kernel does. So the explicit kernel and the Python loop end up dispatching the same Metal workload.
+
+The actual speedup for Apple Silicon training therefore comes from **using MLX at all**, not from writing explicit kernels. The explicit kernels are still used in the PyTorch path (where they matter) and are the fallback for L < 64 bypass logic.
+
+### Running the benchmark
+
+```bash
+python scripts/mlx_train_bench.py     # MLX path: Metal kernel vs lazy eval loop
+python scripts/train_step_bench.py    # PyTorch MPS path: Metal kernel vs Python loop
+```
 
 ---
 
@@ -237,7 +293,7 @@ Performance on those would likely be worse for both teacher and student, and the
 
 ## 8. Known gaps and future work
 
-**Python scan loop.** The selective SSM scan is an O(L) Python loop. With MLX lazy eval this compiles to ~2.3× fewer Metal dispatches than PyTorch MPS, but it's still O(L) dispatch calls. A fused Metal kernel via `mlx.core.custom_op` would reduce this to a single kernel invocation. Estimated 1–2 weeks of Metal Shading Language work. Tracked in `MLX_PLAN.md`.
+**Python scan loop (resolved).** We wrote explicit Metal kernels (`src/ops/selective_scan.py`) and integrated them via `mx.custom_vjp` in the MLX path and `torch.autograd.Function` in the PyTorch path. The kernels give 15.2× speedup in the PyTorch MPS path. In the MLX path they provide no additional speedup because MLX's lazy evaluator already fuses the Python loop into the same Metal workload — see Section 5.1 for the full writeup.
 
 **Greedy decoding only.** The MLX inference uses mlx-whisper's `dec.decode` which doesn't support beam search. The PyTorch student is evaluated with `repetition_penalty=1.1` but no beam search either. Adding beam search to the MLX path would likely close some of the WER gap vs the paper.
 

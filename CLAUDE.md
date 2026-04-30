@@ -87,7 +87,6 @@ The Whisper pipeline (`scripts/run_whisper.py`) orchestrates two stages:
 
 - **Python scan loop**: The selective SSM scan is an O(L) Python loop — correct but slow during training. A fused Metal/Triton kernel would improve throughput significantly.
 
-- **MLX training not yet implemented**: MLX is inference-only. `MLX_PLAN.md` has the full design for MLX training (~600 lines across 6 files).
 
 - **Token budgets**: Stage 1 validates at 100M tokens, debug at 10M. Stage 2 trains to 500M tokens (full) or 10M (debug).
 
