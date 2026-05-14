@@ -15,6 +15,9 @@ MLX training pattern (identical to trainer.py):
     loss, grads = loss_and_grad_fn(model, *args)
     optimizer.update(model, grads)
     mx.eval(model.parameters(), optimizer.state, loss)
+
+Batch conversion: DataLoader returns torch tensors; call .numpy() before
+    passing to mx.array() — same convention as pt_batch_to_mlx in data.py.
 """
 import math
 from datetime import datetime
@@ -32,6 +35,15 @@ from src.mlx.parler_model import (
     ParlerMambaMLX, get_parler_teacher_hiddens, build_first_emb
 )
 from src.mlx import checkpoint as ckpt_io
+
+
+def _to_mlx(batch: dict, keys: list[str]) -> dict[str, mx.array]:
+    """Convert selected torch-tensor batch keys to MLX arrays via numpy.
+
+    Mirrors the pt_batch_to_mlx() convention in src/mlx/data.py so that
+    mx.array() always receives a numpy array, not a raw torch tensor.
+    """
+    return {k: mx.array(batch[k].numpy()) for k in keys}
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +99,7 @@ def train_parler_mlx_stage1(
 
     Batch format (from make_parler_loaders):
         description_ids : (B, T_desc)        int32
-        attention_mask  : (B, T_desc)        float32  (optional)
+        attention_mask  : (B, T_desc)        int32
         prompt_ids      : (B, T_prompt)      int32
         audio_tokens    : (B, T_audio, 9)    int32
         labels          : (B, T_audio, 9)    int32   (-100 = pad)
@@ -103,7 +115,6 @@ def train_parler_mlx_stage1(
 
     total_steps = epochs * len(train_loader)
     optimizer   = optim.Adam(learning_rate=lr)
-    cfg         = student.model.cfg.decoder
 
     def s1_loss_fn(model, enc_hidden, first_emb, t_hiddens):
         _, s_hiddens = model(enc_hidden, first_emb)
@@ -126,9 +137,11 @@ def train_parler_mlx_stage1(
                 total_steps=total_steps, warmup_steps=warmup_steps,
             )
 
-            description_ids = mx.array(batch["description_ids"])
-            prompt_ids      = mx.array(batch["prompt_ids"])
-            audio_tokens    = mx.array(batch["audio_tokens"])
+            # torch tensors → mlx arrays via .numpy() (matches pt_batch_to_mlx)
+            mx_b = _to_mlx(batch, ["description_ids", "prompt_ids", "audio_tokens"])
+            description_ids = mx_b["description_ids"]
+            prompt_ids      = mx_b["prompt_ids"]
+            audio_tokens    = mx_b["audio_tokens"]
 
             # ── Pre-compute frozen encodings (outside grad-fn) ──────────────
             enc_hidden = teacher.text_encoder(description_ids)
@@ -210,9 +223,10 @@ def _val_cosine_loss(
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
-        description_ids = mx.array(batch["description_ids"])
-        prompt_ids      = mx.array(batch["prompt_ids"])
-        audio_tokens    = mx.array(batch["audio_tokens"])
+        mx_b = _to_mlx(batch, ["description_ids", "prompt_ids", "audio_tokens"])
+        description_ids = mx_b["description_ids"]
+        prompt_ids      = mx_b["prompt_ids"]
+        audio_tokens    = mx_b["audio_tokens"]
 
         enc_hidden = teacher.text_encoder(description_ids)
         prompt_emb = student.encode_prompt(prompt_ids)
@@ -299,10 +313,12 @@ def train_parler_mlx_stage2(
                 total_steps=total_steps, warmup_steps=warmup_steps,
             )
 
-            description_ids = mx.array(batch["description_ids"])
-            prompt_ids      = mx.array(batch["prompt_ids"])
-            audio_tokens    = mx.array(batch["audio_tokens"])
-            labels          = mx.array(batch["labels"])      # (B,T,9)
+            # torch tensors → mlx arrays via .numpy()
+            mx_b = _to_mlx(batch, ["description_ids", "prompt_ids", "audio_tokens", "labels"])
+            description_ids = mx_b["description_ids"]
+            prompt_ids      = mx_b["prompt_ids"]
+            audio_tokens    = mx_b["audio_tokens"]
+            labels          = mx_b["labels"]      # (B, T, 9)
 
             # Frozen encodings outside grad-fn
             enc_hidden = student.encode_description(description_ids)
@@ -326,10 +342,10 @@ def train_parler_mlx_stage2(
                 pred_4d    = logits_ss.reshape(B_, T_, num_cb, vocab).argmax(-1)
                                                             # (B,T,9)
                 # Mix: Bernoulli mask per (B, T, codebook)
-                swap_mask   = mx.random.uniform(shape=(B_, T_, num_cb)) < current_p
+                swap_mask    = mx.random.uniform(shape=(B_, T_, num_cb)) < current_p
                 audio_tokens = mx.where(swap_mask, pred_4d, audio_tokens)
                 # Rebuild first_emb with mixed tokens
-                first_emb   = build_first_emb(
+                first_emb    = build_first_emb(
                     student.model.decoder, prompt_emb, audio_tokens
                 )
                 mx.eval(first_emb)
@@ -401,10 +417,11 @@ def _val_ce_loss(
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
-        description_ids = mx.array(batch["description_ids"])
-        prompt_ids      = mx.array(batch["prompt_ids"])
-        audio_tokens    = mx.array(batch["audio_tokens"])
-        labels          = mx.array(batch["labels"])
+        mx_b = _to_mlx(batch, ["description_ids", "prompt_ids", "audio_tokens", "labels"])
+        description_ids = mx_b["description_ids"]
+        prompt_ids      = mx_b["prompt_ids"]
+        audio_tokens    = mx_b["audio_tokens"]
+        labels          = mx_b["labels"]
 
         enc_hidden = student.encode_description(description_ids)
         prompt_emb = student.encode_prompt(prompt_ids)
