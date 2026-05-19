@@ -44,12 +44,26 @@ def main():
     parser.add_argument("--batch_size",   type=int,   default=4)
     parser.add_argument("--lr",           type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int,   default=200)
-    parser.add_argument("--max_audio_len",type=int,   default=512)
+    parser.add_argument("--max_audio_len",    type=int,   default=256)
+    parser.add_argument("--grad_accumulation",type=int,  default=4,
+                        help="Accumulate N micro-batches before optimizer step")
     parser.add_argument("--log_every",    type=int,   default=50)
     parser.add_argument("--eval_every",   type=int,   default=500)
     parser.add_argument("--checkpoint_dir", default="./checkpoints/parler_mamba")
     parser.add_argument("--tb_log_dir",     default="runs/")
+    parser.add_argument("--debug", action="store_true",
+                        help="Quick smoke-test: 1 epoch, eval every 10 steps")
     args = parser.parse_args()
+
+    if args.debug:
+        args.epochs            = 1
+        args.batch_size        = 1
+        args.grad_accumulation = 2
+        args.max_audio_len     = 128
+        args.state_size        = args.state_size or 64  # prevent OOM with Ns=2048
+        args.log_every         = 2
+        args.eval_every        = 10
+        print("[run_parler_stage1] --debug: 1 epoch, batch=1, grad_accum=2, max_audio=128, state_size=64", flush=True)
 
     # Optional YAML overrides (CLI flags win if both specified)
     if args.config:
@@ -74,11 +88,15 @@ def main():
     teacher.freeze()
 
     # ── Build student (fresh backbone copy + SSM replacement) ───────────────
-    from src.mlx.parler_model import ParlerMambaMLX
+    from src.mlx.parler_model import ParlerMambaMLX, apply_weight_surgery_mlx
     print("[run_parler_stage1] Building ParlerMambaMLX student ...", flush=True)
-    # Load a second instance for the student backbone
     student_base = IndicParlerTTS.from_pretrained()
     student = ParlerMambaMLX(student_base, state_size=args.state_size)
+
+    # Warm-start SSM from teacher attention weights (paper Appendix B)
+    print("[run_parler_stage1] Applying weight surgery ...", flush=True)
+    apply_weight_surgery_mlx(student, teacher)
+
     print(student.param_summary(), flush=True)
 
     # ── Data loaders ────────────────────────────────────────────────────────
@@ -107,6 +125,7 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         warmup_steps=args.warmup_steps,
+        grad_accumulation=args.grad_accumulation,
         checkpoint_dir=args.checkpoint_dir,
         tb_log_dir=args.tb_log_dir,
         log_every=args.log_every,

@@ -2,15 +2,7 @@
 import math
 import numpy as np
 import mlx.core as mx
-import mlx_whisper.decoding as dec
 from mlx.utils import tree_flatten, tree_map
-
-from src.mlx.data import pt_batch_to_mlx
-
-_GEN_OPTS = dec.DecodingOptions(
-    language="en", task="transcribe",
-    fp16=False, without_timestamps=True, suppress_blank=True,
-)
 
 
 def cosine_lr_with_warmup(
@@ -43,6 +35,7 @@ def clip_grad_norm(grads: dict, max_norm: float = 1.0) -> tuple[mx.array, dict]:
 def compute_val_loss_mlx(student, val_loader, bos_id: int, max_batches: int = 30) -> float:
     """Teacher-forced cross-entropy on the validation set (no gradient)."""
     from src.mlx.loss import ce_loss
+    from src.mlx.data import pt_batch_to_mlx
 
     total, count = 0.0, 0
     for i, batch in enumerate(val_loader):
@@ -75,25 +68,32 @@ def compute_wer_mlx(
     processor,
     max_batches: int = 10,
 ) -> float | None:
-    """WER via autoregressive decoding.  Uses dec.decode on student.model."""
+    """WER via autoregressive decoding.  Uses mlx_whisper.decoding on student.model."""
     try:
         import jiwer
+        import mlx_whisper.decoding as dec
+        from src.mlx.data import pt_batch_to_mlx
     except ImportError:
         return None
+
+    gen_opts = dec.DecodingOptions(
+        language="en", task="transcribe",
+        fp16=False, without_timestamps=True, suppress_blank=True,
+    )
 
     all_preds, all_refs = [], []
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
         mx_b = pt_batch_to_mlx(batch)
-        mel = mx_b["mel"]  # (B, T, 80)
+        mel = mx_b["mel"]
 
-        labels = batch["labels"]  # still PT tensor
+        labels = batch["labels"]
         refs = processor.batch_decode(labels.clamp(min=0), skip_special_tokens=True)
 
         for b in range(mel.shape[0]):
-            feats = mel[b : b + 1]  # (1, T, 80)
-            result = dec.decode(student.model, feats, _GEN_OPTS)
+            feats = mel[b : b + 1]
+            result = dec.decode(student.model, feats, gen_opts)
             all_preds.append(result[0].text.strip())
 
         all_refs.extend(refs)

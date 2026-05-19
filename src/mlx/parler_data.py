@@ -32,13 +32,20 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+
+try:
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    Dataset = object   # placeholder so the class definition parses
 
 
 class ParlerDistilDataset(Dataset):
@@ -103,11 +110,13 @@ def make_parler_loaders(
     val_cache_dir: str,
     batch_size: int = 4,
     max_audio_len: int = 512,
-) -> tuple[DataLoader, DataLoader]:
+):
     """Return (train_loader, val_loader).
 
     num_workers=0 required — MLX arrays cannot cross process boundaries.
     """
+    if not _TORCH_AVAILABLE:
+        raise ImportError("torch is required for make_parler_loaders. Install it in your training env.")
     train_ds = ParlerDistilDataset(train_cache_dir, max_audio_len)
     val_ds   = ParlerDistilDataset(val_cache_dir,   max_audio_len)
     train_loader = DataLoader(
@@ -127,88 +136,177 @@ def make_parler_loaders(
 
 
 def preprocess_and_cache(
-    hf_dataset_id: str = "parler-tts/parler-tts-mini-v1",
+    hf_dataset_id: str = "ai4b-hf/GLOBE-annotated",
     out_dir: str = "./data/parler_distil",
     split: str = "train",
     max_samples: Optional[int] = None,
     max_audio_len_s: float = 6.0,
-    device: str = "cpu",
+    description_col: str = "auto",
+    lang_filter: Optional[str] = None,
 ) -> None:
     """Pre-process a HuggingFace Parler TTS dataset into .npz cache files.
 
     Requires:
-        pip install datasets transformers parler_tts
-        mlx-audio-train on sys.path (for IndicParlerTTS + DAC encoder)
+        pip install datasets transformers
+        mlx-audio-train on sys.path (for IndicParlerTTS + MLX DAC encoder)
 
-    The teacher's audio encoder (DAC) runs on `device`.
-    Set device='mps' for Apple Silicon GPU acceleration during preprocessing.
+    No HF parler_tts package needed — all encoding uses mlx-audio-train's
+    IndicParlerTTS directly.
+
+    Args:
+        hf_dataset_id:   HF dataset id. Default is ai4b-hf/GLOBE-annotated
+                         (the exact data indic-parler-tts was trained on).
+        description_col: Column name for the style description text.
+                         "auto" probes common names: text_description,
+                         description, caption. GLOBE-annotated uses
+                         "text_description".
+        lang_filter:     If set, keep only rows where sample["language"]
+                         equals this value (e.g. "Hindi", "Tamil").
+                         None = keep all languages.
     """
-    import sys
     from datasets import load_dataset
+    from transformers import AutoTokenizer
 
-    # Lazy imports (mlx-audio-train path must be set by caller)
+    # Lazy import — mlx-audio-train path must be set by caller
     try:
-        from models.indic_parler_tts.model import IndicParlerTTS
         import mlx.core as mx
+        import models  # noqa: F401 — confirms mlx-audio-train is on sys.path
     except ImportError as e:
         raise ImportError(
             "mlx-audio-train not found on sys.path. "
             "Add it with: sys.path.insert(0, '/path/to/mlx-audio-train')"
         ) from e
 
-    from parler_tts import ParlerTTSForConditionalGeneration
-    from transformers import AutoTokenizer
-    import soundfile as sf
-    import io
-
     out_path = Path(out_dir) / split
     out_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"[preprocess] Loading dataset {hf_dataset_id} / {split} ...")
-    ds = load_dataset(hf_dataset_id, split=split)
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+    # Strategy:
+    #   max_samples ≤ 1000  → streaming (fast, no download needed)
+    #   max_samples > 1000 or None → targeted data_files download of only N shards.
+    #     Avoids the full-dataset (90 GB) download while being faster than streaming
+    #     for thousands of samples (xet streaming deadlocks on large datasets).
+    _SHARD_COUNTS = {"train": 184, "test": 5, "validation": 5}
+    total_shards = _SHARD_COUNTS.get(split, 184)
 
-    print("[preprocess] Loading teacher model + tokenizers ...")
-    # HF model for T5 tokenizer + DAC encoder (audio → codec tokens)
-    hf_model = ParlerTTSForConditionalGeneration.from_pretrained(
-        "ai4bharat/indic-parler-tts"
-    ).to(device)
-    hf_model.eval()
+    use_streaming = max_samples is not None and max_samples <= 1000
+    if use_streaming:
+        print(
+            f"[preprocess] Loading dataset {hf_dataset_id} / {split} (streaming) ...",
+            flush=True,
+        )
+        ds = load_dataset(hf_dataset_id, split=split, streaming=True)
+        if lang_filter:
+            ds = ds.filter(lambda x: x.get("language", "") == lang_filter)
+        if max_samples:
+            ds = ds.take(max_samples)
+    else:
+        # Download only enough shards to cover max_samples rows.
+        samples_per_shard = {"train": 3084, "test": 2861}.get(split, 3084)
+        n_shards = min(
+            int((max_samples or 10_000) / samples_per_shard) + 3,
+            total_shards,
+        )
+        print(
+            f"[preprocess] Loading dataset {hf_dataset_id} / {split}: "
+            f"downloading {n_shards}/{total_shards} shards ...",
+            flush=True,
+        )
+        data_files = {
+            split: [
+                f"data/{split}-{i:05d}-of-{total_shards:05d}.parquet"
+                for i in range(n_shards)
+            ]
+        }
+        ds = load_dataset(
+            hf_dataset_id,
+            data_files=data_files,
+            split=split,
+            verification_mode="no_checks",
+        )
+        if lang_filter:
+            ds = ds.filter(lambda x: x.get("language", "") == lang_filter)
+            print(f"[preprocess] After lang_filter='{lang_filter}': {len(ds)} samples", flush=True)
+        if max_samples and len(ds) > max_samples:
+            ds = ds.select(range(max_samples))
 
-    t5_tokenizer  = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
-    # Prompt tokenizer is the same T5 tokenizer for IndicParlerTTS
-    pmt_tokenizer = t5_tokenizer
+    # Resolve description column name
+    _DESC_CANDIDATES = ["text_description", "description", "caption", "prompt"]
+    if description_col == "auto":
+        first = next(iter(ds))
+        description_col = next(
+            (c for c in _DESC_CANDIDATES if c in first),
+            None,
+        )
+        if description_col is None:
+            raise KeyError(
+                f"Cannot find a description column. Tried {_DESC_CANDIDATES}. "
+                f"Available columns: {list(first.keys())}"
+            )
+        print(f"[preprocess] Using description column: '{description_col}'", flush=True)
 
-    max_audio_frames = int(max_audio_len_s * 44100 / 512)
+    # DAC encoder — use mlx-audio-train's own implementation which loads
+    # weights directly from the HF safetensors (no extra pip package needed).
+    try:
+        import importlib.util, os as _os
+        _script = _os.path.join(
+            _os.path.dirname(importlib.util.find_spec("models").origin),
+            "..", "scripts", "preprocess_bhojpuri_dac.py"
+        )
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("_dac_preprocess", _script)
+        _dac_mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_dac_mod)
+        _load_hf_weights = _dac_mod._load_hf_weights
+        _build_dac_encoder = _dac_mod._build_dac_encoder
+        _encode_audio = _dac_mod._encode_audio
+    except Exception as e:
+        raise ImportError(
+            f"Could not load DAC encoder from mlx-audio-train/scripts/preprocess_bhojpuri_dac.py: {e}"
+        ) from e
 
-    print(f"[preprocess] Processing {len(ds)} samples → {out_path}")
+    print("[preprocess] Loading DAC encoder weights from ai4bharat/indic-parler-tts ...")
+    _weights = _load_hf_weights("ai4bharat/indic-parler-tts")
+    _dac_enc, _dac_quant = _build_dac_encoder(_weights)
+    del _weights  # free memory
+    print("[preprocess] DAC encoder ready")
+
+    # T5 tokenizer — from HF hub, no parler_tts package needed
+    t5_tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
+
+    # DAC expected sample rate
+    DAC_SR = 44100
+    max_audio_frames = int(max_audio_len_s * DAC_SR / 512)
+
+    n_desc = len(ds) if not use_streaming else (max_samples or "?")
+    print(f"[preprocess] Processing {n_desc} samples → {out_path}")
     for idx, sample in enumerate(ds):
         # 1. T5-tokenize description
         desc_enc = t5_tokenizer(
-            sample["description"], return_tensors="pt",
+            sample[description_col], return_tensors="np",
             truncation=True, max_length=256,
         )
-        description_ids = desc_enc["input_ids"][0].numpy()    # (T_desc,)
-        attention_mask  = desc_enc["attention_mask"][0].numpy()
+        description_ids = desc_enc["input_ids"][0].astype(np.int32)
+        attention_mask  = desc_enc["attention_mask"][0].astype(np.int32)
 
         # 2. Tokenize prompt text (text to speak)
-        pmt_enc  = pmt_tokenizer(
-            sample["text"], return_tensors="pt",
+        pmt_enc = t5_tokenizer(
+            sample["text"], return_tensors="np",
             truncation=True, max_length=128,
         )
-        prompt_ids = pmt_enc["input_ids"][0].numpy()          # (T_prompt,)
+        prompt_ids = pmt_enc["input_ids"][0].astype(np.int32)
 
-        # 3. Decode audio to waveform, then encode with DAC
-        audio_arr = sample["audio"]["array"]   # float32 waveform
+        # 3. Resample to 44100 Hz if needed, then DAC-encode
+        audio_arr = np.array(sample["audio"]["array"], dtype=np.float32)
         sr        = sample["audio"]["sampling_rate"]
-        import torch as _torch
-        with _torch.no_grad():
-            # HF audio encoder expects (batch, time)
-            wav_t = _torch.tensor(audio_arr, dtype=_torch.float32).unsqueeze(0).to(device)
-            enc   = hf_model.audio_encoder.encode(wav_t, bandwidth=6.0)
-            codes = enc.audio_codes[0]  # (1, 9, T_codec)
-            codes = codes.squeeze(0).cpu().numpy().T  # (T_codec, 9)
+        if sr != DAC_SR:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g         = gcd(int(sr), DAC_SR)
+            audio_arr = resample_poly(audio_arr, DAC_SR // g, sr // g).astype(np.float32)
+
+        # _encode_audio returns (9, T_frames) int16
+        codes_9T  = _encode_audio(_dac_enc, _dac_quant, audio_arr)  # (9, T)
+        codes     = codes_9T.T.astype(np.int32)                     # (T, 9)
 
         T_codec = codes.shape[0]
         num_cb  = codes.shape[1]  # 9
@@ -239,6 +337,6 @@ def preprocess_and_cache(
         )
 
         if (idx + 1) % 100 == 0:
-            print(f"  {idx + 1} / {len(ds)}", flush=True)
+            print(f"  {idx + 1} done", flush=True)
 
-    print(f"[preprocess] Done. {len(ds)} files in {out_path}")
+    print(f"[preprocess] Done. {idx + 1} files in {out_path}")

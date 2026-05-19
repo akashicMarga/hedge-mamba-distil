@@ -7,9 +7,8 @@ teacher:
   # T5 encoder and DAC decoder are not distilled; only the AR decoder matters
 
 student:
-  state_size: null        # null = hidden_size (1024), paper default N=D
-                          # Reduce to 256/512 for faster training & inference
-                          # at cost of quality
+  state_size: 256         # 256 → Ns=512 after Hedgehog doubling (~3.4 GB backward/layer with Ns=2048)
+                          # Use 64 for debug, 256 for M-series training, null=1024 for paper default
 
 # ---------------------------------------------------------------------------
 # Stage 1: cosine distillation (SSM layers only)

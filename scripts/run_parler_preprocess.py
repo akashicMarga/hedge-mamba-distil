@@ -2,10 +2,11 @@
 """Offline preprocessing: DAC-encode audio and apply delay pattern.
 
 Run once before Stage 1/2 training to build the .npz cache.
+Uses IndicParlerTTS from mlx-audio-train — no parler_tts pip package needed.
 
 Usage::
 
-    # Train split
+    # Train split (full)
     python scripts/run_parler_preprocess.py \
         --mlx_audio_train /path/to/mlx-audio-train \
         --split train \
@@ -17,15 +18,18 @@ Usage::
         --split validation \
         --out_dir ./data/parler_distil
 
-Outputs one .npz file per sample under {out_dir}/{split}/.
-Each file contains: description_ids, attention_mask, prompt_ids,
-audio_tokens (T,9), labels (T,9).
+    # Debug: 100 samples only (~2 min)
+    python scripts/run_parler_preprocess.py \
+        --mlx_audio_train /path/to/mlx-audio-train \
+        --debug --out_dir ./data/parler_distil_debug
+
+Outputs one .npz per sample under {out_dir}/{split}/.
+Each file: description_ids, attention_mask, prompt_ids, audio_tokens (T,9), labels (T,9).
 """
 import argparse
 import sys
 from pathlib import Path
 
-# ── make repo importable ──────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -33,15 +37,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mlx_audio_train", required=True,
-        help="Path to mlx-audio-train repo (needed for IndicParlerTTS + DAC)",
+        help="Path to mlx-audio-train repo (IndicParlerTTS + MLX DAC)",
     )
     parser.add_argument(
-        "--dataset", default="parler-tts/parler-tts-mini-v1",
-        help="HuggingFace dataset id with (description, text, audio) columns",
+        "--dataset", default="ai4b-hf/GLOBE-annotated",
+        help="HuggingFace dataset id. Default: ai4b-hf/GLOBE-annotated "
+             "(the exact data indic-parler-tts was trained on, 567K samples, 90 GB audio)",
     )
     parser.add_argument(
         "--split", default="train",
-        help="Dataset split to process (train / validation / test)",
+        help="Dataset split: train / validation / test",
     )
     parser.add_argument(
         "--out_dir", default="./data/parler_distil",
@@ -49,19 +54,28 @@ def main():
     )
     parser.add_argument(
         "--max_samples", type=int, default=None,
-        help="Limit number of samples (useful for debugging)",
+        help="Limit number of samples",
     )
     parser.add_argument(
         "--max_audio_len_s", type=float, default=6.0,
-        help="Truncate audio longer than this many seconds (default 6s ≈ 512 frames)",
+        help="Truncate audio longer than this (default 6 s ≈ 512 frames at 44100/512)",
     )
     parser.add_argument(
-        "--device", default="cpu",
-        help="Torch device for DAC encoder: cpu | mps | cuda",
+        "--lang_filter", default=None,
+        help="Keep only rows with this language (e.g. Hindi, Tamil, Telugu). "
+             "None = all languages. GLOBE-annotated language values are full "
+             "English names: 'Hindi', 'Tamil', 'Telugu', 'Kannada', etc.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Quick smoke-test: process 100 samples only",
     )
     args = parser.parse_args()
 
-    # Add mlx-audio-train to path (provides IndicParlerTTS + MLX DAC)
+    if args.debug:
+        args.max_samples = args.max_samples or 100
+        print("[preprocess] --debug: capping at 100 samples", flush=True)
+
     sys.path.insert(0, args.mlx_audio_train)
 
     from src.mlx.parler_data import preprocess_and_cache
@@ -72,7 +86,7 @@ def main():
         split=args.split,
         max_samples=args.max_samples,
         max_audio_len_s=args.max_audio_len_s,
-        device=args.device,
+        lang_filter=args.lang_filter,
     )
 
 

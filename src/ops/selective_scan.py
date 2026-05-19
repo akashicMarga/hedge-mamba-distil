@@ -26,7 +26,14 @@ selective_scan(u, dt, A, B, C, h_prev) → (y, h_final)
 """
 
 from __future__ import annotations
-import torch
+try:
+    import torch
+    _AutogradBase = torch.autograd.Function
+    _TORCH_AVAILABLE = True
+except (ImportError, AttributeError):
+    torch = None
+    _AutogradBase = object
+    _TORCH_AVAILABLE = False
 
 _fwd_inf_kernel   = None   # inference forward (no h_states)
 _fwd_train_kernel = None   # training forward (saves h_states)
@@ -471,7 +478,7 @@ def _pt_scan_backward(u, dt, A, B, C, h0, grad_y, grad_h_final):
 
 # ── autograd.Function ──────────────────────────────────────────────────────────
 
-class _SelectiveScanMetal(torch.autograd.Function):
+class _SelectiveScanMetal(_AutogradBase):
     """Forward via Metal kernel (training variant), backward via Metal or PyTorch."""
 
     @staticmethod
@@ -705,6 +712,10 @@ def selective_scan_mlx(u, dt, A, B, C, h0=None):
         return _mx_scan_python_loop(u, dt, A, B, C, h0)
 
     if _selective_scan_mlx_fn is None:
+        if not hasattr(mx, 'custom_vjp'):
+            # MLX < 0.32 doesn't have custom_vjp — use the Python loop instead.
+            # It's still fully differentiable through MLX's standard autograd.
+            return _mx_scan_python_loop(u, dt, A, B, C, h0)
         _build_mlx_scan_fn()
 
     return _selective_scan_mlx_fn(u, dt, A, B, C, h0)

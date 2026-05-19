@@ -121,6 +121,12 @@ class ParlerMambaMLX(nn.Module):
         for layer in self.model.decoder.layers:
             layer.self_attn = ParlerMambaSelfAttnMLX(D, H, state_size=self.state_size)
 
+        # Remove DACDecoder from MLX module tree — it stores weights in raw
+        # Python lists (not nn.Module children), which breaks trainable_parameters()
+        # and update(). DAC is not needed during training (only for inference).
+        # Stored separately so eval scripts can still access it.
+        self._dac = self.model.pop('dac', None)
+
         # Default: Stage 2 freeze profile (safe default for evaluation)
         self.freeze_for_stage2()
 
@@ -128,18 +134,17 @@ class ParlerMambaMLX(nn.Module):
 
     def freeze_for_stage1(self) -> None:
         """Stage 1: only SSM layers (layer.self_attn) are trainable."""
-        self.model.freeze()
+        # Must freeze from student root so student.trainable_parameters() is correct
+        self.freeze()
         for layer in self.model.decoder.layers:
             layer.self_attn.unfreeze()
 
     def freeze_for_stage2(self) -> None:
         """Stage 2: decoder layers + final_ln train; T5 + embeddings frozen."""
-        self.model.freeze()
-        # Unfreeze decoder transformer blocks
+        self.freeze()
         for layer in self.model.decoder.layers:
             layer.unfreeze()
         self.model.decoder.final_ln.unfreeze()
-        # LM head trains (outputs codec token distributions)
         self.model.decoder.lm_heads.unfreeze()
         # Keep frozen: codebook embeddings, position embeddings
         for emb in self.model.decoder.embed_tokens:
@@ -148,8 +153,17 @@ class ParlerMambaMLX(nn.Module):
 
     # ── Encode helpers (called outside the grad-fn for efficiency) ──────────
 
-    def encode_description(self, description_ids: mx.array) -> mx.array:
+    def encode_description(
+        self,
+        description_ids: mx.array,
+        attention_mask: mx.array | None = None,
+    ) -> mx.array:
         """T5 encoder (frozen). Returns enc_hidden (B, T_desc, 1024)."""
+        if attention_mask is not None:
+            try:
+                return self.model.text_encoder(description_ids, attention_mask=attention_mask)
+            except TypeError:
+                pass
         return self.model.text_encoder(description_ids)
 
     def encode_prompt(self, prompt_ids: mx.array) -> mx.array:
@@ -266,6 +280,86 @@ def build_first_emb(
     T_total  = full_emb.shape[1]
     pos      = decoder.embed_positions.weight[prompt_offset : prompt_offset + T_total]
     return full_emb + pos[None]  # broadcast over batch
+
+
+# ---------------------------------------------------------------------------
+# Weight surgery  (paper Appendix B, MLX edition)
+# ---------------------------------------------------------------------------
+
+
+def apply_weight_surgery_mlx(student: ParlerMambaMLX, teacher) -> None:
+    """Warm-start SSM weights from teacher self-attention projections.
+
+    MLX architecture differs from PyTorch: hhog_k/q operate on the N-dim
+    x_proj output (not on D-dim hidden directly).  We therefore warm-start
+    x_proj's B/C slots instead of hhog.phi, and copy v/out projections.
+
+    Mapping (per layer):
+      x_proj.weight[dt_rank : dt_rank+N, :] <- teacher k_proj.weight[:N, :]
+      x_proj.weight[dt_rank+N :,          ] <- teacher q_proj.weight[:N, :]
+      v_proj.weight                          <- teacher v_proj.weight
+      out_proj.weight                        <- teacher out_proj.weight
+      conv_weight[:, -1, :]                  <- 1.0  (near-identity causal conv)
+
+    Teacher self-attn attribute names are probed at runtime because
+    mlx-audio-train may use q_proj/k_proj or q/k conventions.
+    """
+    def _get_attn(t_layer, name: str):
+        attn = t_layer.self_attn
+        for attr in (name, name.replace("_proj", ""), name[0]):
+            if hasattr(attn, attr):
+                return getattr(attn, attr)
+        raise AttributeError(
+            f"Teacher self_attn has no attribute matching '{name}'. "
+            f"Available: {[a for a in dir(attn) if not a.startswith('_')]}"
+        )
+
+    t_layers = teacher.decoder.layers
+    s_layers = student.model.decoder.layers
+
+    for t_layer, s_layer in zip(t_layers, s_layers):
+        mixer   = s_layer.self_attn.mixer   # HedgeMambaMixerMLX
+        N       = mixer.state_size
+        dt_rank = mixer.dt_rank
+
+        try:
+            t_k = _get_attn(t_layer, "k_proj")
+            t_q = _get_attn(t_layer, "q_proj")
+            t_v = _get_attn(t_layer, "v_proj")
+            t_o = _get_attn(t_layer, "out_proj")
+        except AttributeError as e:
+            print(f"[surgery] WARNING: {e} — skipping weight surgery for this layer")
+            return
+
+        # x_proj warm-start: B slot ← k_proj[:N], C slot ← q_proj[:N]
+        xw = mixer.x_proj.weight                       # (dt_rank+2N, D) in MLX
+        xw_np = xw.astype(mx.float32)
+        k_rows = t_k.weight.astype(mx.float32)[:N, :]  # (N, D)
+        q_rows = t_q.weight.astype(mx.float32)[:N, :]  # (N, D)
+
+        new_xw = mx.concatenate([
+            xw_np[:dt_rank, :],                        # dt rows unchanged
+            k_rows,                                    # B slot
+            q_rows,                                    # C slot
+        ], axis=0)
+        mixer.x_proj.weight = new_xw
+
+        # v_proj and out_proj copy directly (D×D → D×D)
+        mixer.v_proj.weight   = t_v.weight.astype(mx.float32)
+        mixer.out_proj.weight = t_o.weight.astype(mx.float32)
+
+        # Near-identity causal conv: last kernel position = 1, rest = 0
+        D, k, _ = mixer.conv_weight.shape
+        conv_new = mx.zeros((D, k, 1))
+        # Set last kernel slice to identity
+        eye_col  = mx.ones((D, 1, 1))
+        conv_new = mx.concatenate(
+            [mx.zeros((D, k - 1, 1)), eye_col], axis=1
+        )
+        mixer.conv_weight = conv_new
+
+    mx.eval(student.parameters())
+    print("[surgery] Weight surgery complete — SSM warm-started from teacher attention", flush=True)
 
 
 # ---------------------------------------------------------------------------
